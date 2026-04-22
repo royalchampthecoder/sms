@@ -7,8 +7,7 @@ if (isset($_SESSION['user'])) {
     header("Location: /sms/dashboard");
     exit;
 }
-
-// If not logged in, redirect to login
+// If user is not logged in, redirect to login
 header("Location: /sms/dashboard/login");
 exit;
 ?>
