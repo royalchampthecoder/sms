@@ -1,53 +1,29 @@
 <?php
-ini_set('display_errors', 1);
-error_reporting(E_ALL);
+declare(strict_types=1);
 
-include "../config.php";
+require_once __DIR__ . "/common.php";
 
-header('Content-Type: application/json');
-
-$data = json_decode(file_get_contents("php://input"), true);
-
-if (!$data || empty($data['device_id'])) {
-    echo json_encode([
-        "success" => false,
-        "error" => "device_id required"
-    ]);
-    exit;
+if ($_SERVER["REQUEST_METHOD"] !== "POST") {
+    api_response(["success" => false, "error" => "Use POST for this endpoint."], 405);
 }
 
-$device_id = trim($data['device_id']);
+$input = api_input();
+$device = require_device_auth($input);
 
-$stmt = $conn->prepare("SELECT api_key FROM devices WHERE device_id = ?");
-$stmt->bind_param("s", $device_id);
-$stmt->execute();
-$res = $stmt->get_result();
-
-if ($res && $res->num_rows > 0) {
-    $row = $res->fetch_assoc();
-    echo json_encode([
-        "success" => true,
-        "api_key" => $row['api_key']
-    ]);
-    exit;
+if (!empty($input["device_name"])) {
+    db_run("UPDATE devices SET device_name = ? WHERE id = ?", [trim((string) $input["device_name"]), $device["id"]]);
 }
 
-$api_key = bin2hex(random_bytes(16));
+$device = update_device_heartbeat($device, ["source" => "register_device"]);
 
-$stmt = $conn->prepare("INSERT INTO devices (device_id, api_key, status) VALUES (?, ?, 'offline')");
-$stmt->bind_param("ss", $device_id, $api_key);
-
-if ($stmt->execute()) {
-    echo json_encode([
-        "success" => true,
-        "api_key" => $api_key
-    ]);
-} else {
-    echo json_encode([
-        "success" => false,
-        "error" => "Failed to register device"
-    ]);
-}
-
-exit;
-?>
+api_response([
+    "success" => true,
+    "message" => "Device verified successfully.",
+    "device" => [
+        "device_id" => $device["device_id"],
+        "device_name" => $device["device_name"],
+        "status" => $device["status"],
+        "api_key" => $device["api_key"],
+    ],
+    "config" => get_device_runtime_config($device),
+]);

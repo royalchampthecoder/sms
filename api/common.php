@@ -1,65 +1,92 @@
 <?php
-include "../config.php";
+declare(strict_types=1);
 
-function jsonResponse($data, $code = 200) {
-    http_response_code($code);
-    header("Content-Type: application/json");
-    echo json_encode($data);
+require_once __DIR__ . "/../dashboard/functions.php";
+
+header("Content-Type: application/json");
+header("Access-Control-Allow-Origin: *");
+header("Access-Control-Allow-Methods: GET, POST, OPTIONS");
+header("Access-Control-Allow-Headers: Content-Type, Authorization, X-API-Key");
+
+if ($_SERVER["REQUEST_METHOD"] === "OPTIONS") {
+    http_response_code(204);
     exit;
 }
 
-function getJsonInput() {
+function api_response(array $data, int $status = 200): never
+{
+    http_response_code($status);
+    echo json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    exit;
+}
+
+function api_input(): array
+{
     $raw = file_get_contents("php://input");
-    $data = json_decode($raw, true);
-    return is_array($data) ? $data : [];
+    $decoded = json_decode($raw ?: "{}", true);
+    if (is_array($decoded) && $decoded !== []) {
+        return $decoded;
+    }
+
+    return $_POST ?: $_GET;
 }
 
-function formatIndianPhone($phone) {
-    $phone = trim($phone);
-    $phone = preg_replace('/\D+/', '', $phone);
-
-    if (strlen($phone) === 10) {
-        return '+91' . $phone;
+function api_key_from_request(array $input = []): string
+{
+    $authHeader = $_SERVER["HTTP_AUTHORIZATION"] ?? "";
+    if (str_starts_with(strtolower($authHeader), "bearer ")) {
+        return trim(substr($authHeader, 7));
     }
 
-    if (strlen($phone) === 12 && substr($phone, 0, 2) === '91') {
-        return '+' . $phone;
-    }
-
-    if (strlen($phone) === 13 && substr($phone, 0, 3) === '+91') {
-        return $phone;
-    }
-
-    return false;
+    return trim(
+        (string) (
+            $_SERVER["HTTP_X_API_KEY"]
+            ?? $input["api_key"]
+            ?? $_GET["api_key"]
+            ?? ""
+        )
+    );
 }
 
-function validateDevice($conn, $deviceId, $apiKey) {
-    $stmt = $conn->prepare("SELECT * FROM devices WHERE device_id = ? AND api_key = ? LIMIT 1");
-    $stmt->bind_param("ss", $deviceId, $apiKey);
-    $stmt->execute();
-    $res = $stmt->get_result();
-
-    if (!$res || $res->num_rows === 0) {
-        jsonResponse(["success" => false, "message" => "Unauthorized device"], 401);
+function require_api_client(array $input = []): array
+{
+    $apiKey = api_key_from_request($input);
+    if ($apiKey === "") {
+        api_response(["success" => false, "error" => "API key is required."], 401);
     }
 
-    $conn->query("UPDATE devices SET status='online', last_ping=NOW() WHERE device_id='" . $conn->real_escape_string($deviceId) . "'");
-}
-
-function getDeviceConfig($conn, $deviceId) {
-    $stmt = $conn->prepare("SELECT sms_delay, sim_slot, retry_limit FROM config WHERE device_id = ? LIMIT 1");
-    $stmt->bind_param("s", $deviceId);
-    $stmt->execute();
-    $res = $stmt->get_result();
-
-    if ($res && $res->num_rows > 0) {
-        return $res->fetch_assoc();
+    $api = get_api_client_by_key($apiKey);
+    if ($api === null) {
+        api_response(["success" => false, "error" => "Invalid or expired API key."], 401);
     }
 
-    return [
-        "sms_delay" => 5,
-        "sim_slot" => 0,
-        "retry_limit" => 2
-    ];
+    if (!api_request_allowed((int) $api["id"], (int) $api["rate_limit_per_minute"])) {
+        api_response(["success" => false, "error" => "API rate limit exceeded."], 429);
+    }
+
+    db_run("UPDATE apis SET last_used_at = NOW() WHERE id = ?", [$api["id"]]);
+    log_activity("api", "api.request", ["endpoint" => basename($_SERVER["SCRIPT_NAME"] ?? "")], null, (int) $api["id"]);
+
+    return $api;
 }
-?>
+
+function require_device_auth(array $input = []): array
+{
+    $deviceId = trim((string) ($input["device_id"] ?? ""));
+    $apiKey = trim((string) ($input["api_key"] ?? api_key_from_request($input)));
+
+    if ($deviceId === "" || $apiKey === "") {
+        api_response(["success" => false, "error" => "device_id and api_key are required."], 401);
+    }
+
+    $device = validate_device_credentials($deviceId, $apiKey);
+    if ($device === null) {
+        api_response(["success" => false, "error" => "Invalid device credentials."], 401);
+    }
+
+    if (!(bool) $device["is_active"]) {
+        api_response(["success" => false, "error" => "Device is inactive."], 403);
+    }
+
+    return $device;
+}

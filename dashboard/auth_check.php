@@ -1,8 +1,6 @@
 <?php
-session_start();
+declare(strict_types=1);
 
-if (!isset($_SESSION['user'])) {
-    header("Location: /sms/dashboard/login");
-    exit;
-}
-?>
+require_once __DIR__ . "/functions.php";
+
+$authUser = require_login();

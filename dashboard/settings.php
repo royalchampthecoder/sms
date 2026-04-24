@@ -1,367 +1,325 @@
 <?php
-include "auth_check.php";
-include "../config.php";
+declare(strict_types=1);
 
-$success = "";
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $device = $_POST['device_id'];
-    $delay = (int)$_POST['sms_delay'];
-    $sim = (int)$_POST['sim_slot'];
-    $retry = (int)$_POST['retry_limit'];
+require_once __DIR__ . "/auth_check.php";
 
-    $stmt = $conn->prepare("
-        REPLACE INTO config (device_id, sms_delay, sim_slot, retry_limit)
-        VALUES (?, ?, ?, ?)
-    ");
-    $stmt->bind_param("siii", $device, $delay, $sim, $retry);
-    $stmt->execute();
-    $success = "Settings saved successfully";
-}
-?>
-<!DOCTYPE html>
-<html>
-<head>
-  <!-- Required meta tags -->
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
-  <meta content="SMS Dashboard" name="author">
-  <title>Settings - SMS Dashboard</title>
-  
-  <!-- Favicon icon-->
-  <link rel="icon" type="image/png" sizes="32x32" href="./assets/images/favicon/favicon-32x32.png" />
-  
-  <!-- Color modes -->
-  <script src="./assets/js/vendors/color-modes.js"></script>
-  <script>
-    if (localStorage.getItem('sidebarExpanded') === 'false') {
-      document.documentElement.classList.add('collapsed');
-      document.documentElement.classList.remove('expanded');
-    } else {
-      document.documentElement.classList.remove('collapsed');
-      document.documentElement.classList.add('expanded');
+if ($_SERVER["REQUEST_METHOD"] === "POST") {
+    verify_csrf();
+
+    try {
+        $action = (string) ($_POST["action"] ?? "");
+
+        if ($action === "change_password") {
+            $current = (string) ($_POST["current_password"] ?? "");
+            $new = (string) ($_POST["new_password"] ?? "");
+            $confirm = (string) ($_POST["confirm_password"] ?? "");
+
+            if (!password_verify($current, $authUser["password_hash"])) {
+                throw new RuntimeException("Current password is incorrect.");
+            }
+            if ($new === "" || $new !== $confirm) {
+                throw new RuntimeException("New passwords do not match.");
+            }
+
+            set_user_password((int) $authUser["id"], $new, false);
+            flash_set("success", "Password updated successfully.");
+        }
+
+        if ($authUser["role"] === "admin" && $action === "save_system_settings") {
+            $msg91Enabled = !empty($_POST["msg91_enabled"]);
+            if ($msg91Enabled) {
+                $mode = (string) ($_POST["msg91_api_mode"] ?? "legacy");
+                if (trim((string) ($_POST["msg91_auth_key"] ?? "")) === "") {
+                    throw new RuntimeException("MSG91 auth key is required when MSG91 is enabled.");
+                }
+                if ($mode === "legacy") {
+                    if (trim((string) ($_POST["msg91_sender_id"] ?? "")) === "" || trim((string) ($_POST["msg91_route"] ?? "")) === "") {
+                        throw new RuntimeException("MSG91 sender ID and route are required in legacy mode.");
+                    }
+                }
+                if ($mode === "flow" && trim((string) ($_POST["msg91_template_id"] ?? $_POST["msg91_flow_id"] ?? "")) === "") {
+                    throw new RuntimeException("Flow mode requires template_id or flow_id.");
+                }
+            } elseif (!routing_fallback_available_without_msg91()) {
+                throw new RuntimeException("MSG91 cannot be disabled while no online device or custom gateway is available.");
+            }
+
+            $settings = [
+                ["sms_delay_seconds", (int) ($_POST["sms_delay_seconds"] ?? 5), "int"],
+                ["sim_slot_preference", $_POST["sim_slot_preference"] ?? "auto", "string"],
+                ["retry_limit", (int) ($_POST["retry_limit"] ?? 3), "int"],
+                ["retry_delay_seconds", (int) ($_POST["retry_delay_seconds"] ?? 60), "int"],
+                ["rate_limit_per_minute", (int) ($_POST["rate_limit_per_minute"] ?? 30), "int"],
+                ["daily_limit_per_user", (int) ($_POST["daily_limit_per_user"] ?? 1000), "int"],
+                ["device_offline_after_minutes", (int) ($_POST["device_offline_after_minutes"] ?? 2), "int"],
+                ["device_disconnect_after_minutes", (int) ($_POST["device_disconnect_after_minutes"] ?? 10), "int"],
+                ["device_ack_timeout_minutes", (int) ($_POST["device_ack_timeout_minutes"] ?? 3), "int"],
+                ["default_signature", $_POST["default_signature"] ?? "", "string"],
+                ["quiet_hours_enabled", !empty($_POST["quiet_hours_enabled"]), "bool"],
+                ["quiet_hours_start", $_POST["quiet_hours_start"] ?? "22:00", "string"],
+                ["quiet_hours_end", $_POST["quiet_hours_end"] ?? "06:00", "string"],
+                ["msg91_enabled", $msg91Enabled, "bool"],
+                ["msg91_api_mode", $_POST["msg91_api_mode"] ?? "legacy", "string"],
+                ["msg91_base_url", $_POST["msg91_base_url"] ?? "https://api.msg91.com", "string"],
+                ["msg91_auth_key", $_POST["msg91_auth_key"] ?? "", "string"],
+                ["msg91_sender_id", $_POST["msg91_sender_id"] ?? "", "string"],
+                ["msg91_route", $_POST["msg91_route"] ?? "4", "string"],
+                ["msg91_country", $_POST["msg91_country"] ?? "91", "string"],
+                ["msg91_dlt_template_id", $_POST["msg91_dlt_template_id"] ?? "", "string"],
+                ["msg91_flow_id", $_POST["msg91_flow_id"] ?? "", "string"],
+                ["msg91_template_id", $_POST["msg91_template_id"] ?? "", "string"],
+                ["msg91_headers_json", json_decode((string) ($_POST["msg91_headers_json"] ?? "{}"), true) ?? [], "json"],
+                ["msg91_short_url", $_POST["msg91_short_url"] ?? "0", "string"],
+                ["msg91_short_url_expiry", $_POST["msg91_short_url_expiry"] ?? "", "string"],
+                ["msg91_realtime_response", $_POST["msg91_realtime_response"] ?? "1", "string"],
+            ];
+
+            foreach ($settings as [$key, $value, $type]) {
+                save_setting($key, $value, $type);
+            }
+
+            flash_set("success", "System settings updated.");
+        }
+
+        if ($authUser["role"] === "admin" && $action === "add_blacklist") {
+            $phone = normalize_phone((string) ($_POST["phone"] ?? ""));
+            if ($phone === null) {
+                throw new RuntimeException("Invalid phone number.");
+            }
+
+            db_run(
+                "INSERT INTO blacklist (phone, reason, added_by) VALUES (?, ?, ?)
+                 ON DUPLICATE KEY UPDATE reason = VALUES(reason), added_by = VALUES(added_by)",
+                [$phone, trim((string) ($_POST["reason"] ?? "")), $authUser["id"]]
+            );
+            flash_set("success", "Phone added to blacklist.");
+        }
+
+        if ($authUser["role"] === "admin" && $action === "remove_blacklist") {
+            db_run("DELETE FROM blacklist WHERE id = ?", [(int) $_POST["blacklist_id"]]);
+            flash_set("success", "Blacklist entry removed.");
+        }
+    } catch (Throwable $exception) {
+        flash_set("danger", $exception->getMessage());
     }
-  </script>
-  
-  <!-- Libs CSS -->
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Public+Sans:wght@300;400;500;600;700;800&display=swap" />
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/simplebar@6.2.1/dist/simplebar.min.css" />
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@2.47.0/tabler-icons.min.css" />
 
-  <!-- Theme CSS -->
-  <link rel="stylesheet" href="./assets/css/theme.css" />
-  
-  <!-- Custom styles -->
-  <style>
-  .bg-gradient-mixed { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
-  
-  /* Sidebar collapse styles */
-  #miniSidebar {
-    transition: width 0.3s ease;
-  }
-  
-  /* Hide text when collapsed */
-  html.collapsed #miniSidebar .text {
-    display: none !important;
-  }
-  
-  html.expanded #miniSidebar .text {
-    display: inline !important;
-  }
-  
-  /* Active nav link styling */
-  #miniSidebar .nav-link.active {
-    background-color: rgba(102, 126, 234, 0.1);
-    color: #667eea;
-  }
-  
-  #miniSidebar .nav-link.active .nav-icon {
-    color: #667eea;
-  }
-  
-  /* Adjust custom container padding */
-  .custom-container {
-    padding: 1.5rem 1.5rem;
-  }
-  </style>
-</head>
+    redirect_to("settings.php");
+}
 
-<body>
-  <!-- Vertical Sidebar -->
-  <div>
-    <!-- Sidebar -->
-    <div id="miniSidebar">
-      <div class="brand-logo">
-        <a class="d-none d-md-flex align-items-center gap-2" href="./">
-          <span class="fw-bold fs-4 site-logo-text">SMS Dashboard</span>
-        </a>
-      </div>
-      <ul class="navbar-nav flex-column">
-        <!-- Nav item -->
-        <li class="nav-item">
-          <a class="nav-link" href="./">
-            <span class="nav-icon"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="icon icon-tabler icons-tabler-outline icon-tabler-layout-dashboard">
-                <path stroke="none" d="M0 0h24v24H0z" fill="none" />
-                <path d="M4 4h6v8h-6z" />
-                <path d="M4 16h6v4h-6z" />
-                <path d="M14 12h6v8h-6z" />
-                <path d="M14 4h6v4h-6z" />
-              </svg></span>
-            <span class="text">Dashboard</span>
-          </a>
-        </li>
-        <!-- Nav item -->
-        <li class="nav-item">
-          <a class="nav-link" href="devices.php">
-            <span class="nav-icon"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="icon icon-tabler icons-tabler-outline icon-tabler-device-mobile">
-                <path stroke="none" d="M0 0h24v24H0z" fill="none" />
-                <path d="M6 5a2 2 0 0 1 2 -2h8a2 2 0 0 1 2 2v14a2 2 0 0 1 -2 2h-8a2 2 0 0 1 -2 -2v-14z" />
-                <path d="M11 4h2" />
-                <path d="M12 17v.01" />
-              </svg></span>
-            <span class="text">Devices</span>
-          </a>
-        </li>
-        <!-- Nav item -->
-        <li class="nav-item">
-          <a class="nav-link" href="messages.php">
-            <span class="nav-icon"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="icon icon-tabler icons-tabler-outline icon-tabler-message">
-                <path stroke="none" d="M0 0h24v24H0z" fill="none" />
-                <path d="M8 9h8" />
-                <path d="M8 13h6" />
-                <path d="M18 4a3 3 0 0 1 3 3v8a3 3 0 0 1 -3 3h-5l-5 4v-4h-2a3 3 0 0 1 -3 -3v-8a3 3 0 0 1 3 -3h12z" />
-              </svg></span>
-            <span class="text">Messages</span>
-          </a>
-        </li>
-        <!-- Nav item -->
-        <li class="nav-item">
-          <a class="nav-link active" href="settings.php">
-            <span class="nav-icon"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="icon icon-tabler icons-tabler-outline icon-tabler-settings">
-                <path stroke="none" d="M0 0h24v24H0z" fill="none" />
-                <path d="M10.325 4.317c.426 -1.756 2.924 -1.756 3.35 0a1.724 1.724 0 0 0 2.573 1.066c1.543 -.94 3.31 .826 2.37 2.37a1.724 1.724 0 0 0 1.065 2.572c1.756 .426 1.756 2.924 0 3.35a1.724 1.724 0 0 0 -1.066 2.573c.94 1.543 -.826 3.31 -2.37 2.37a1.724 1.724 0 0 0 -2.572 1.065c-.426 1.756 -2.924 1.756 -3.35 0a1.724 1.724 0 0 0 -2.573 -1.066c-1.543 .94 -3.31 -.826 -2.37 -2.37a1.724 1.724 0 0 0 -1.065 -2.572c-1.756 -.426 -1.756 -2.924 0 -3.35a1.724 1.724 0 0 0 1.066 -2.573c-.94 -1.543 .826 -3.31 2.37 -2.37c.593 .36 1.269 .36 1.862 0z" />
-                <path d="M9 12a3 3 0 1 0 6 0a3 3 0 0 0 -6 0" />
-              </svg></span>
-            <span class="text">Settings</span>
-          </a>
-        </li>
-        <!-- Nav item -->
-        <li class="nav-item">
-          <a class="nav-link" href="upload.php">
-            <span class="nav-icon"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="icon icon-tabler icons-tabler-outline icon-tabler-upload">
-                <path stroke="none" d="M0 0h24v24H0z" fill="none" />
-                <path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2 -2v-2" />
-                <path d="M7 9l5 -5l5 5" />
-                <path d="M12 4v12" />
-              </svg></span>
-            <span class="text">Bulk Upload</span>
-          </a>
-        </li>
-        <!-- Nav item -->
-        <li class="nav-item">
-          <a class="nav-link text-danger" href="logout.php">
-            <span class="nav-icon"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="icon icon-tabler icons-tabler-outline icon-tabler-logout">
-                <path stroke="none" d="M0 0h24v24H0z" fill="none" />
-                <path d="M14 8v-2a2 2 0 0 0 -2 -2h-7a2 2 0 0 0 -2 2v12a2 2 0 0 0 2 2h7a2 2 0 0 0 2 -2v-2" />
-                <path d="M9 12h12l-3 -3" />
-                <path d="M18 15l3 -3" />
-              </svg></span>
-            <span class="text">Logout</span>
-          </a>
-        </li>
-      </ul>
-    </div>
+$blacklist = $authUser["role"] === "admin" ? db_fetch_all("SELECT b.*, u.username FROM blacklist b LEFT JOIN users u ON u.id = b.added_by ORDER BY b.created_at DESC") : [];
 
-    <!-- Main Content -->
-    <div id="content" class="position-relative h-100">
-      <!-- Topbar -->
-      <div class="navbar-glass navbar navbar-expand-lg px-0 px-lg-4">
-        <div class="container-fluid px-lg-0">
-          <div class="d-flex align-items-center gap-4">
-            <!-- Collapse -->
-            <div class="d-block d-lg-none">
-              <a class="text-inherit" data-bs-toggle="offcanvas" href="#offcanvasExample" role="button" aria-controls="offcanvasExample">
-                <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon icon-tabler icons-tabler-outline icon-tabler-menu-2">
-                  <path stroke="none" d="M0 0h24v24H0z" fill="none" />
-                  <path d="M4 6l16 0" />
-                  <path d="M4 12l16 0" />
-                  <path d="M4 18l16 0" />
-                </svg>
-              </a>
+$pageTitle = "Settings";
+$activePage = "settings.php";
+
+require __DIR__ . "/partials/header.php";
+?>
+
+<?php if ($authUser["role"] === "admin"): ?>
+    <div class="glass-panel p-4 mb-4">
+        <h2 class="h5 mb-3">System Settings</h2>
+        <form method="post" class="row g-3">
+            <?= csrf_input() ?>
+            <input type="hidden" name="action" value="save_system_settings">
+            <div class="col-md-3">
+                <label class="form-label fw-semibold">SMS Delay (sec)</label>
+                <input type="number" name="sms_delay_seconds" class="form-control" value="<?= (int) app_setting("sms_delay_seconds", 5) ?>">
             </div>
-            <div class="d-none d-lg-block">
-              <a class="sidebar-toggle d-flex texttooltip p-3" href="javascript:void(0)" data-template="collapseMessage">
-                <span class="collapse-mini">
-                  <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="icon icon-tabler icons-tabler-outline icon-tabler-arrow-bar-left text-secondary">
-                    <path stroke="none" d="M0 0h24v24H0z" fill="none" />
-                    <path d="M4 12l10 0" />
-                    <path d="M4 12l4 4" />
-                    <path d="M4 12l4 -4" />
-                    <path d="M20 4l0 16" />
-                  </svg>
-                </span>
-                <span class="collapse-expanded">
-                  <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="icon icon-tabler icons-tabler-outline icon-tabler-arrow-bar-right text-secondary">
-                    <path stroke="none" d="M0 0h24v24H0z" fill="none" />
-                    <path d="M20 12l-10 0" />
-                    <path d="M20 12l-4 4" />
-                    <path d="M20 12l-4 -4" />
-                    <path d="M4 4l0 16" />
-                  </svg>
-                  <div id="collapseMessage" class="d-none">
-                    <span class="small">Collapse</span>
-                  </div>
-                </span>
-              </a>
+            <div class="col-md-3">
+                <label class="form-label fw-semibold">Retry Limit</label>
+                <input type="number" name="retry_limit" class="form-control" value="<?= (int) app_setting("retry_limit", 3) ?>">
             </div>
-          </div>
-        </div>
-      </div>
-      
-      <!-- Container -->
-      <div class="custom-container">
-        <!-- Heading -->
-        <div class="mb-6">
-          <h1 class="fs-4">Settings</h1>
-          <p class="text-muted">Configure device settings and preferences</p>
-        </div>
-
-        <!-- Settings Form -->
-        <div class="row">
-          <div class="col-lg-6">
-            <div class="card card-lg">
-              <div class="card-header border-bottom-0">
-                <div>
-                  <h5 class="mb-0">Device Configuration</h5>
+            <div class="col-md-3">
+                <label class="form-label fw-semibold">Retry Delay (sec)</label>
+                <input type="number" name="retry_delay_seconds" class="form-control" value="<?= (int) app_setting("retry_delay_seconds", 60) ?>">
+            </div>
+            <div class="col-md-3">
+                <label class="form-label fw-semibold">SIM Preference</label>
+                <select name="sim_slot_preference" class="form-select">
+                    <?php foreach (["auto" => "Automatic", "sim1" => "SIM1", "sim2" => "SIM2"] as $value => $label): ?>
+                        <option value="<?= h($value) ?>" <?= app_setting("sim_slot_preference", "auto") === $value ? "selected" : "" ?>><?= h($label) ?></option>
+                    <?php endforeach; ?>
+                </select>
+            </div>
+            <div class="col-md-3">
+                <label class="form-label fw-semibold">User Rate / Min</label>
+                <input type="number" name="rate_limit_per_minute" class="form-control" value="<?= (int) app_setting("rate_limit_per_minute", 30) ?>">
+            </div>
+            <div class="col-md-3">
+                <label class="form-label fw-semibold">Daily Limit / User</label>
+                <input type="number" name="daily_limit_per_user" class="form-control" value="<?= (int) app_setting("daily_limit_per_user", 1000) ?>">
+            </div>
+            <div class="col-md-3">
+                <label class="form-label fw-semibold">Offline After (min)</label>
+                <input type="number" name="device_offline_after_minutes" class="form-control" value="<?= (int) app_setting("device_offline_after_minutes", 2) ?>">
+            </div>
+            <div class="col-md-3">
+                <label class="form-label fw-semibold">Disconnect After (min)</label>
+                <input type="number" name="device_disconnect_after_minutes" class="form-control" value="<?= (int) app_setting("device_disconnect_after_minutes", 10) ?>">
+            </div>
+            <div class="col-md-3">
+                <label class="form-label fw-semibold">Ack Timeout (min)</label>
+                <input type="number" name="device_ack_timeout_minutes" class="form-control" value="<?= (int) app_setting("device_ack_timeout_minutes", 3) ?>">
+            </div>
+            <div class="col-md-9">
+                <label class="form-label fw-semibold">Default Signature</label>
+                <input type="text" name="default_signature" class="form-control" value="<?= h((string) app_setting("default_signature", "")) ?>">
+            </div>
+            <div class="col-md-3">
+                <div class="form-check mt-4 pt-2">
+                    <input class="form-check-input" type="checkbox" name="quiet_hours_enabled" id="quiet_hours_enabled" <?= app_setting("quiet_hours_enabled", false) ? "checked" : "" ?>>
+                    <label class="form-check-label" for="quiet_hours_enabled">Enable quiet hours</label>
                 </div>
-              </div>
-              <div class="card-body">
-                <?php if(!empty($success)) { ?>
-                <div class="alert alert-success"><?php echo $success; ?></div>
-                <?php } ?>
-                <form method="post">
-                  <div class="mb-3">
-                    <label class="form-label">Device ID</label>
-                    <select name="device_id" class="form-control" required>
-                      <option value="">Select Device</option>
-                      <?php
-                      $devices = $conn->query("SELECT id FROM devices");
-                      while ($d = $devices->fetch_assoc()) {
-                        echo "<option value='{$d['id']}'>{$d['id']}</option>";
-                      }
-                      ?>
-                    </select>
-                  </div>
-
-                  <div class="mb-3">
-                    <label class="form-label">SMS Delay (seconds)</label>
-                    <input class="form-control" name="sms_delay" type="number" placeholder="5" value="5" required>
-                  </div>
-
-                  <div class="mb-3">
-                    <label class="form-label">SIM Slot</label>
-                    <select name="sim_slot" class="form-control">
-                      <option value="0">SIM 1</option>
-                      <option value="1">SIM 2</option>
-                    </select>
-                  </div>
-
-                  <div class="mb-3">
-                    <label class="form-label">Retry Limit</label>
-                    <input class="form-control" name="retry_limit" type="number" placeholder="2" value="2" required>
-                  </div>
-
-                  <button class="btn btn-primary w-100">Save Settings</button>
-                </form>
-              </div>
             </div>
-          </div>
+            <div class="col-md-3">
+                <label class="form-label fw-semibold">Quiet Start</label>
+                <input type="time" name="quiet_hours_start" class="form-control" value="<?= h((string) app_setting("quiet_hours_start", "22:00")) ?>">
+            </div>
+            <div class="col-md-3">
+                <label class="form-label fw-semibold">Quiet End</label>
+                <input type="time" name="quiet_hours_end" class="form-control" value="<?= h((string) app_setting("quiet_hours_end", "06:00")) ?>">
+            </div>
+
+            <div class="col-12"><hr></div>
+            <div class="col-12 d-flex justify-content-between align-items-center">
+                <h3 class="h6 mb-0">MSG91 Configuration</h3>
+                <div class="form-check">
+                    <input class="form-check-input" type="checkbox" name="msg91_enabled" id="msg91_enabled" <?= app_setting("msg91_enabled", false) ? "checked" : "" ?>>
+                    <label class="form-check-label" for="msg91_enabled">Enable MSG91</label>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <label class="form-label fw-semibold">Mode</label>
+                <select name="msg91_api_mode" class="form-select">
+                    <option value="legacy" <?= app_setting("msg91_api_mode", "legacy") === "legacy" ? "selected" : "" ?>>Legacy</option>
+                    <option value="flow" <?= app_setting("msg91_api_mode", "legacy") === "flow" ? "selected" : "" ?>>Flow</option>
+                </select>
+            </div>
+            <div class="col-md-3">
+                <label class="form-label fw-semibold">Base URL</label>
+                <input type="text" name="msg91_base_url" class="form-control" value="<?= h((string) app_setting("msg91_base_url", "https://api.msg91.com")) ?>">
+            </div>
+            <div class="col-md-3">
+                <label class="form-label fw-semibold">Auth Key</label>
+                <input type="text" name="msg91_auth_key" class="form-control" value="<?= h((string) app_setting("msg91_auth_key", "")) ?>">
+            </div>
+            <div class="col-md-3">
+                <label class="form-label fw-semibold">Sender ID</label>
+                <input type="text" name="msg91_sender_id" class="form-control" value="<?= h((string) app_setting("msg91_sender_id", "")) ?>">
+            </div>
+            <div class="col-md-3">
+                <label class="form-label fw-semibold">Route</label>
+                <input type="text" name="msg91_route" class="form-control" value="<?= h((string) app_setting("msg91_route", "4")) ?>">
+            </div>
+            <div class="col-md-3">
+                <label class="form-label fw-semibold">Country</label>
+                <input type="text" name="msg91_country" class="form-control" value="<?= h((string) app_setting("msg91_country", "91")) ?>">
+            </div>
+            <div class="col-md-3">
+                <label class="form-label fw-semibold">DLT Template ID</label>
+                <input type="text" name="msg91_dlt_template_id" class="form-control" value="<?= h((string) app_setting("msg91_dlt_template_id", "")) ?>">
+            </div>
+            <div class="col-md-3">
+                <label class="form-label fw-semibold">Flow ID</label>
+                <input type="text" name="msg91_flow_id" class="form-control" value="<?= h((string) app_setting("msg91_flow_id", "")) ?>">
+            </div>
+            <div class="col-md-4">
+                <label class="form-label fw-semibold">Template ID</label>
+                <input type="text" name="msg91_template_id" class="form-control" value="<?= h((string) app_setting("msg91_template_id", "")) ?>">
+            </div>
+            <div class="col-md-4">
+                <label class="form-label fw-semibold">Short URL Flag</label>
+                <input type="text" name="msg91_short_url" class="form-control" value="<?= h((string) app_setting("msg91_short_url", "0")) ?>">
+            </div>
+            <div class="col-md-4">
+                <label class="form-label fw-semibold">Short URL Expiry</label>
+                <input type="text" name="msg91_short_url_expiry" class="form-control" value="<?= h((string) app_setting("msg91_short_url_expiry", "")) ?>">
+            </div>
+            <div class="col-md-4">
+                <label class="form-label fw-semibold">Real Time Response</label>
+                <input type="text" name="msg91_realtime_response" class="form-control" value="<?= h((string) app_setting("msg91_realtime_response", "1")) ?>">
+            </div>
+            <div class="col-12">
+                <label class="form-label fw-semibold">Extra Headers JSON</label>
+                <textarea name="msg91_headers_json" class="form-control" rows="3"><?= h(json_encode(app_setting("msg91_headers_json", []), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)) ?></textarea>
+            </div>
+            <div class="col-12">
+                <button class="btn btn-primary" type="submit">Save System Settings</button>
+            </div>
+        </form>
+    </div>
+
+    <div class="glass-panel p-4 mt-4">
+        <h2 class="h5 mb-3">Blacklist Numbers</h2>
+        <form method="post" class="row g-3 mb-4">
+            <?= csrf_input() ?>
+            <input type="hidden" name="action" value="add_blacklist">
+            <div class="col-md-4">
+                <label class="form-label fw-semibold">Phone</label>
+                <input type="text" name="phone" class="form-control" required>
+            </div>
+            <div class="col-md-6">
+                <label class="form-label fw-semibold">Reason</label>
+                <input type="text" name="reason" class="form-control">
+            </div>
+            <div class="col-md-2 d-flex align-items-end">
+                <button class="btn btn-outline-danger w-100" type="submit">Add</button>
+            </div>
+        </form>
+        <div class="table-responsive">
+            <table class="table align-middle">
+                <thead>
+                <tr>
+                    <th>Phone</th>
+                    <th>Reason</th>
+                    <th>Added By</th>
+                    <th>Created</th>
+                    <th></th>
+                </tr>
+                </thead>
+                <tbody>
+                <?php foreach ($blacklist as $row): ?>
+                    <tr>
+                        <td><?= h(display_phone($row["phone"])) ?></td>
+                        <td><?= h($row["reason"]) ?></td>
+                        <td><?= h($row["username"] ?: "system") ?></td>
+                        <td><?= h(pretty_date($row["created_at"])) ?></td>
+                        <td>
+                            <form method="post" onsubmit="return confirm('Remove this number from blacklist?');">
+                                <?= csrf_input() ?>
+                                <input type="hidden" name="action" value="remove_blacklist">
+                                <input type="hidden" name="blacklist_id" value="<?= (int) $row["id"] ?>">
+                                <button class="btn btn-outline-secondary btn-sm" type="submit">Remove</button>
+                            </form>
+                        </td>
+                    </tr>
+                <?php endforeach; ?>
+                </tbody>
+            </table>
         </div>
-      </div>
     </div>
-  </div>
+<?php endif; ?>
 
-  <!-- Mobile Offcanvas Menu -->
-  <div class="offcanvas offcanvas-start" tabindex="-1" id="offcanvasExample" aria-labelledby="offcanvasExampleLabel">
-    <div class="offcanvas-header">
-      <h5 class="offcanvas-title" id="offcanvasExampleLabel">SMS Dashboard</h5>
-      <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
-    </div>
-    <div class="offcanvas-body p-0">
-      <ul class="navbar-nav flex-column">
-        <li class="nav-item">
-          <a class="nav-link" href="./" data-bs-dismiss="offcanvas">
-            <span class="nav-icon"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="icon icon-tabler icons-tabler-outline icon-tabler-layout-dashboard">
-                <path stroke="none" d="M0 0h24v24H0z" fill="none" />
-                <path d="M4 4h6v8h-6z" />
-                <path d="M4 16h6v4h-6z" />
-                <path d="M14 12h6v8h-6z" />
-                <path d="M14 4h6v4h-6z" />
-              </svg></span>
-            <span class="text">Dashboard</span>
-          </a>
-        </li>
-        <li class="nav-item">
-          <a class="nav-link" href="devices.php" data-bs-dismiss="offcanvas">
-            <span class="nav-icon"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="icon icon-tabler icons-tabler-outline icon-tabler-device-mobile">
-                <path stroke="none" d="M0 0h24v24H0z" fill="none" />
-                <path d="M6 5a2 2 0 0 1 2 -2h8a2 2 0 0 1 2 2v14a2 2 0 0 1 -2 2h-8a2 2 0 0 1 -2 -2v-14z" />
-                <path d="M11 4h2" />
-                <path d="M12 17v.01" />
-              </svg></span>
-            <span class="text">Devices</span>
-          </a>
-        </li>
-        <li class="nav-item">
-          <a class="nav-link" href="messages.php" data-bs-dismiss="offcanvas">
-            <span class="nav-icon"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="icon icon-tabler icons-tabler-outline icon-tabler-message">
-                <path stroke="none" d="M0 0h24v24H0z" fill="none" />
-                <path d="M8 9h8" />
-                <path d="M8 13h6" />
-                <path d="M18 4a3 3 0 0 1 3 3v8a3 3 0 0 1 -3 3h-5l-5 4v-4h-2a3 3 0 0 1 -3 -3v-8a3 3 0 0 1 3 -3h12z" />
-              </svg></span>
-            <span class="text">Messages</span>
-          </a>
-        </li>
-        <li class="nav-item">
-          <a class="nav-link" href="settings.php" data-bs-dismiss="offcanvas">
-            <span class="nav-icon"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="icon icon-tabler icons-tabler-outline icon-tabler-settings">
-                <path stroke="none" d="M0 0h24v24H0z" fill="none" />
-                <path d="M10.325 4.317c.426 -1.756 2.924 -1.756 3.35 0a1.724 1.724 0 0 0 2.573 1.066c1.543 -.94 3.31 .826 2.37 2.37a1.724 1.724 0 0 0 1.065 2.572c1.756 .426 1.756 2.924 0 3.35a1.724 1.724 0 0 0 -1.066 2.573c.94 1.543 -.826 3.31 -2.37 2.37a1.724 1.724 0 0 0 -2.572 1.065c-.426 1.756 -2.924 1.756 -3.35 0a1.724 1.724 0 0 0 -2.573 -1.066c-1.543 .94 -3.31 -.826 -2.37 -2.37a1.724 1.724 0 0 0 -1.065 -2.572c-1.756 -.426 -1.756 -2.924 0 -3.35a1.724 1.724 0 0 0 1.066 -2.573c-.94 -1.543 .826 -3.31 2.37 -2.37c.593 .36 1.269 .36 1.862 0z" />
-                <path d="M9 12a3 3 0 1 0 6 0a3 3 0 0 0 -6 0" />
-              </svg></span>
-            <span class="text">Settings</span>
-          </a>
-        </li>
-        <li class="nav-item">
-          <a class="nav-link" href="upload.php" data-bs-dismiss="offcanvas">
-            <span class="nav-icon"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="icon icon-tabler icons-tabler-outline icon-tabler-upload">
-                <path stroke="none" d="M0 0h24v24H0z" fill="none" />
-                <path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2 -2v-2" />
-                <path d="M7 9l5 -5l5 5" />
-                <path d="M12 4v12" />
-              </svg></span>
-            <span class="text">Bulk Upload</span>
-          </a>
-        </li>
-        <li class="nav-item">
-          <a class="nav-link text-danger" href="logout.php" data-bs-dismiss="offcanvas">
-            <span class="nav-icon"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="icon icon-tabler icons-tabler-outline icon-tabler-logout">
-                <path stroke="none" d="M0 0h24v24H0z" fill="none" />
-                <path d="M14 8v-2a2 2 0 0 0 -2 -2h-7a2 2 0 0 0 -2 2v12a2 2 0 0 0 2 2h7a2 2 0 0 0 2 -2v-2" />
-                <path d="M9 12h12l-3 -3" />
-                <path d="M18 15l3 -3" />
-              </svg></span>
-            <span class="text">Logout</span>
-          </a>
-        </li>
-      </ul>
-    </div>
-  </div>
+<div class="glass-panel p-4 mt-4">
+    <h2 class="h5 mb-3">Password</h2>
+    <form method="post" class="row g-3">
+        <?= csrf_input() ?>
+        <input type="hidden" name="action" value="change_password">
+        <div class="col-md-4">
+            <label class="form-label fw-semibold">Current Password</label>
+            <input type="password" name="current_password" class="form-control" required>
+        </div>
+        <div class="col-md-4">
+            <label class="form-label fw-semibold">New Password</label>
+            <input type="password" name="new_password" class="form-control" required>
+        </div>
+        <div class="col-md-4">
+            <label class="form-label fw-semibold">Confirm Password</label>
+            <input type="password" name="confirm_password" class="form-control" required>
+        </div>
+        <div class="col-12">
+            <button class="btn btn-primary" type="submit">Update Password</button>
+        </div>
+    </form>
+</div>
 
-  <!-- Scripts -->
-  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-  <script src="./assets/js/vendors/sidebarnav.js"></script>
-</body>
-</html>
+<?php require __DIR__ . "/partials/footer.php"; ?>

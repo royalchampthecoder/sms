@@ -1,13 +1,10 @@
 <?php
-// Root index.php - Redirect to dashboard
-session_start();
+declare(strict_types=1);
 
-// If user is logged in, redirect to dashboard
-if (isset($_SESSION['user'])) {
-    header("Location: /sms/dashboard");
-    exit;
+require_once __DIR__ . "/dashboard/functions.php";
+
+if (is_logged_in()) {
+    redirect_to("dashboard/index.php");
 }
-// If user is not logged in, redirect to login
-header("Location: /sms/dashboard/login");
-exit;
-?>
+
+redirect_to("dashboard/login.php");

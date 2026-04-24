@@ -1,116 +1,36 @@
 <?php
-include "../config.php";
+declare(strict_types=1);
 
-function jsonResponse($data, $code = 200) {
-    http_response_code($code);
-    echo json_encode($data);
-    exit;
+require_once __DIR__ . "/common.php";
+
+if ($_SERVER["REQUEST_METHOD"] !== "POST") {
+    api_response(["success" => false, "error" => "Use POST for this endpoint."], 405);
 }
 
-function validateDevice($conn, $deviceId, $apiKey) {
-    $stmt = $conn->prepare("SELECT id FROM devices WHERE device_id=? AND api_key=? LIMIT 1");
-    $stmt->bind_param("ss", $deviceId, $apiKey);
-    $stmt->execute();
-    $res = $stmt->get_result();
+$input = api_input();
+$device = require_device_auth($input);
+$device = update_device_heartbeat($device, ["source" => "get_messages"]);
 
-    if (!$res || $res->num_rows === 0) {
-        jsonResponse(["success" => false, "message" => "Invalid device"], 401);
-    }
-}
+$message = fetch_next_device_message($device);
 
-function getDeviceConfig($conn, $deviceId) {
-    $stmt = $conn->prepare("SELECT sms_delay, sim_slot, retry_limit FROM config WHERE device_id=? LIMIT 1");
-    $stmt->bind_param("s", $deviceId);
-    $stmt->execute();
-    $res = $stmt->get_result();
-
-    if ($res && $res->num_rows > 0) {
-        return $res->fetch_assoc();
-    }
-
-    $stmt = $conn->prepare("INSERT INTO config (device_id, sms_delay, sim_slot, retry_limit) VALUES (?, 5, 0, 2)");
-    $stmt->bind_param("s", $deviceId);
-    $stmt->execute();
-
-    return [
-        "sms_delay" => 5,
-        "sim_slot" => 0,
-        "retry_limit" => 2
-    ];
-}
-
-$data = json_decode(file_get_contents("php://input"), true);
-
-$deviceId = trim($data['device_id'] ?? '');
-$apiKey = trim($data['api_key'] ?? '');
-
-if ($deviceId === '' || $apiKey === '') {
-    jsonResponse(["success" => false, "message" => "device_id and api_key required"], 400);
-}
-
-validateDevice($conn, $deviceId, $apiKey);
-$config = getDeviceConfig($conn, $deviceId);
-
-$conn->begin_transaction();
-
-try {
-    $stmt = $conn->prepare("
-        SELECT id, phone, message, retry_count, max_retry
-        FROM messages
-        WHERE status='pending'
-          AND retry_count < max_retry
-        ORDER BY id ASC
-        LIMIT 1
-        FOR UPDATE
-    ");
-    $stmt->execute();
-    $res = $stmt->get_result();
-
-    if (!$res || $res->num_rows === 0) {
-        $conn->commit();
-        jsonResponse([
-            "success" => true,
-            "message" => null,
-            "config" => [
-                "sms_delay" => (int)$config['sms_delay'],
-                "sim_slot" => (int)$config['sim_slot'],
-                "retry_limit" => (int)$config['retry_limit']
-            ]
-        ]);
-    }
-
-    $msg = $res->fetch_assoc();
-
-    $stmt = $conn->prepare("
-        UPDATE messages
-        SET status='processing', device_id=?, last_attempt_at=NOW()
-        WHERE id=? AND status='pending'
-    ");
-    $stmt->bind_param("si", $deviceId, $msg['id']);
-    $stmt->execute();
-
-    $conn->commit();
-
-    jsonResponse([
+if ($message === null) {
+    api_response([
         "success" => true,
-        "message" => [
-            "id" => (int)$msg['id'],
-            "phone" => $msg['phone'],
-            "message" => $msg['message'],
-            "retry_count" => (int)$msg['retry_count'],
-            "max_retry" => (int)$msg['max_retry']
-        ],
-        "config" => [
-            "sms_delay" => (int)$config['sms_delay'],
-            "sim_slot" => (int)$config['sim_slot'],
-            "retry_limit" => (int)$config['retry_limit']
-        ]
+        "message" => null,
+        "config" => get_device_runtime_config($device),
     ]);
-} catch (Exception $e) {
-    $conn->rollback();
-    jsonResponse([
-        "success" => false,
-        "message" => $e->getMessage()
-    ], 500);
 }
-?>
+
+api_response([
+    "success" => true,
+    "message" => [
+        "id" => (int) $message["id"],
+        "phone" => $message["phone"],
+        "display_phone" => display_phone($message["phone"]),
+        "message" => $message["rendered_message"] ?: $message["message_text"],
+        "language_code" => $message["language_code"],
+        "retry_count" => (int) $message["retry_count"],
+        "max_retry" => (int) $message["max_retry"],
+    ],
+    "config" => get_device_runtime_config($device),
+]);

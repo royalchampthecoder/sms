@@ -1,100 +1,21 @@
 <?php
-include "../config.php";
-include "auth.php";
+declare(strict_types=1);
 
-header("Content-Type: application/json");
+require_once __DIR__ . "/common.php";
 
-$data = json_decode(file_get_contents("php://input"), true);
+$input = api_input();
+$device = require_device_auth($input);
+$device = update_device_heartbeat($device, ["source" => "get_config"]);
 
-if (!$data || !isset($data['device_id']) || empty(trim($data['device_id']))) {
-    echo json_encode([
-        "success" => false,
-        "error" => "device_id required"
-    ]);
-    exit;
-}
-
-if (!function_exists('validate')) {
-    echo json_encode([
-        "success" => false,
-        "error" => "validate() function not found in auth.php"
-    ]);
-    exit;
-}
-
-validate($data);
-
-$device_id = trim($data['device_id']);
-
-$stmt = $conn->prepare("SELECT sms_delay, sim_slot FROM config WHERE device_id=? LIMIT 1");
-
-if (!$stmt) {
-    echo json_encode([
-        "success" => false,
-        "error" => "Prepare failed: " . $conn->error
-    ]);
-    exit;
-}
-
-$stmt->bind_param("s", $device_id);
-
-if (!$stmt->execute()) {
-    echo json_encode([
-        "success" => false,
-        "error" => "Execute failed: " . $stmt->error
-    ]);
-    exit;
-}
-
-$res = $stmt->get_result();
-
-if ($res === false) {
-    echo json_encode([
-        "success" => false,
-        "error" => "get_result() failed. mysqlnd may not be enabled."
-    ]);
-    exit;
-}
-
-if ($res->num_rows == 0) {
-    $stmt->close();
-
-    $stmt = $conn->prepare("INSERT INTO config (device_id, sms_delay, sim_slot) VALUES (?, 5, 0)");
-
-    if (!$stmt) {
-        echo json_encode([
-            "success" => false,
-            "error" => "Prepare insert failed: " . $conn->error
-        ]);
-        exit;
-    }
-
-    $stmt->bind_param("s", $device_id);
-
-    if (!$stmt->execute()) {
-        echo json_encode([
-            "success" => false,
-            "error" => "Insert failed: " . $stmt->error
-        ]);
-        exit;
-    }
-
-    echo json_encode([
-        "success" => true,
-        "sms_delay" => 5,
-        "sim_slot" => 0
-    ]);
-    exit;
-}
-
-$row = $res->fetch_assoc();
-
-echo json_encode([
+api_response([
     "success" => true,
-    "sms_delay" => (int)$row['sms_delay'],
-    "sim_slot" => (int)$row['sim_slot']
+    "config" => get_device_runtime_config($device),
+    "device" => [
+        "device_id" => $device["device_id"],
+        "device_name" => $device["device_name"],
+        "status" => $device["status"],
+        "is_active" => (bool) $device["is_active"],
+        "daily_limit" => (int) $device["daily_limit"],
+        "sent_today" => (int) $device["sms_sent_today"],
+    ],
 ]);
-
-$stmt->close();
-exit;
-?>

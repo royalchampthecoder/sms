@@ -1,3 +1,7 @@
 <?php
-echo "PHP WORKING";
-?>
+declare(strict_types=1);
+
+require_once __DIR__ . "/functions.php";
+
+require_admin();
+redirect_to("worker.php");
