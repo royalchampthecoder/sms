@@ -7,9 +7,10 @@ require_once __DIR__ . "/common.php";
  * ===============================
  * DEVICE PING API (HEARTBEAT)
  * ===============================
- * - Authenticates device
- * - Updates last seen / heartbeat
- * - Returns device info + runtime config
+ * FLOW:
+ * - Device sends ONLY api_key (first time)
+ * - Server finds device using api_key
+ * - Returns device_id + device_name + config
  */
 
 // 🔹 Allow only POST
@@ -23,27 +24,30 @@ if ($_SERVER["REQUEST_METHOD"] !== "POST") {
 // 🔹 Get JSON input
 $input = api_input();
 
-// 🔹 Validate required fields
-if (empty($input['device_id']) || empty($input['api_key'])) {
+// 🔹 Validate API KEY (IMPORTANT)
+if (empty($input['api_key'])) {
     api_response([
         "success" => false,
-        "error" => "device_id and api_key are required"
+        "error" => "api_key is required"
     ], 400);
 }
 
 try {
 
-    // 🔹 Authenticate device
-    $device = require_device_auth($input);
+    // 🔹 Get device using API KEY ONLY
+    $device = db_row(
+        "SELECT * FROM devices WHERE api_key = ? LIMIT 1",
+        [$input['api_key']]
+    );
 
     if (!$device) {
         api_response([
             "success" => false,
-            "error" => "Unauthorized device"
+            "error" => "Invalid API key"
         ], 401);
     }
 
-    // 🔹 Update heartbeat + optional metadata
+    // 🔹 Update heartbeat
     $updatedDevice = update_device_heartbeat($device, [
         "battery"     => $input["battery"] ?? null,
         "network"     => $input["network"] ?? null,
@@ -51,11 +55,11 @@ try {
         "device_meta" => $input["device_meta"] ?? null,
     ]);
 
-    // 🔹 Safety fallback (avoid null issues)
+    // 🔹 Safe fallback
     $deviceName = $updatedDevice["device_name"] ?? "Unnamed Device";
 
-    // 🔹 Build response
-    $response = [
+    // 🔹 FINAL RESPONSE
+    api_response([
         "success" => true,
 
         "device" => [
@@ -71,13 +75,10 @@ try {
         ],
 
         "config" => get_device_runtime_config($updatedDevice),
-    ];
-
-    api_response($response);
+    ]);
 
 } catch (Exception $e) {
 
-    // 🔴 Handle auth / runtime errors
     api_response([
         "success" => false,
         "error"   => $e->getMessage()
