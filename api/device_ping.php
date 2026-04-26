@@ -7,10 +7,8 @@ require_once __DIR__ . "/common.php";
  * ===============================
  * DEVICE PING API (HEARTBEAT)
  * ===============================
- * FLOW:
- * - Device sends ONLY api_key (first time)
- * - Server finds device using api_key
- * - Returns device_id + device_name + config
+ * - First time: API key only
+ * - Later: API key + device_id
  */
 
 // 🔹 Allow only POST
@@ -24,7 +22,7 @@ if ($_SERVER["REQUEST_METHOD"] !== "POST") {
 // 🔹 Get JSON input
 $input = api_input();
 
-// 🔹 Validate API KEY (IMPORTANT)
+// 🔹 API key is REQUIRED
 if (empty($input['api_key'])) {
     api_response([
         "success" => false,
@@ -34,20 +32,34 @@ if (empty($input['api_key'])) {
 
 try {
 
-    // 🔹 Get device using API KEY ONLY
-    $device = db_row(
-        "SELECT * FROM devices WHERE api_key = ? LIMIT 1",
-        [$input['api_key']]
-    );
+    // ===============================
+    // 🔹 STEP 1: AUTHENTICATE DEVICE
+    // ===============================
 
-    if (!$device) {
-        api_response([
-            "success" => false,
-            "error" => "Invalid API key"
-        ], 401);
+    if (!empty($input['device_id'])) {
+        // ✅ Normal flow (device already connected)
+        $device = require_device_auth($input);
+    } else {
+        // ✅ First-time connection (NO device_id)
+        $pdo = db();
+
+        $stmt = $pdo->prepare("SELECT * FROM devices WHERE api_key = ? LIMIT 1");
+        $stmt->execute([$input['api_key']]);
+
+       $device = $stmt->fetch();
+
+        if (!$device) {
+            api_response([
+                "success" => false,
+                "error" => "Invalid API key"
+            ], 401);
+        }
     }
 
-    // 🔹 Update heartbeat
+    // ===============================
+    // 🔹 STEP 2: UPDATE HEARTBEAT
+    // ===============================
+
     $updatedDevice = update_device_heartbeat($device, [
         "battery"     => $input["battery"] ?? null,
         "network"     => $input["network"] ?? null,
@@ -58,7 +70,9 @@ try {
     // 🔹 Safe fallback
     $deviceName = $updatedDevice["device_name"] ?? "Unnamed Device";
 
-    // 🔹 FINAL RESPONSE
+    // ===============================
+    // 🔹 RESPONSE
+    // ===============================
     api_response([
         "success" => true,
 
