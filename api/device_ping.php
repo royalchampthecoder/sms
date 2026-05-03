@@ -27,14 +27,14 @@ if (empty($input['api_key'])) {
 
 try {
 
-    $pdo = db();
+    $conn = db(); // ✅ mysqli
 
     // ===============================
     // 🔹 STEP 1: AUTH
     // ===============================
 
     if (!empty($input['device_id'])) {
-        // Existing device
+
         $device = require_device_auth($input);
 
         if (!$device) {
@@ -53,11 +53,22 @@ try {
         }
 
     } else {
-        // First-time connection
-        $stmt = $pdo->prepare("SELECT * FROM devices WHERE api_key = ? LIMIT 1");
-        $stmt->execute([$input['api_key']]);
 
-        $device = $stmt->fetch();
+        // 🔹 First-time connection (mysqli version)
+        $stmt = $conn->prepare("SELECT * FROM devices WHERE api_key = ? LIMIT 1");
+
+        if (!$stmt) {
+            api_response([
+                "success" => false,
+                "error" => "DB prepare failed"
+            ], 500);
+        }
+
+        $stmt->bind_param("s", $input['api_key']);
+        $stmt->execute();
+
+        $result = $stmt->get_result();
+        $device = $result->fetch_assoc();
 
         if (!$device) {
             api_response([
@@ -66,39 +77,41 @@ try {
             ], 401);
         }
 
-        // 🔹 Save device_name (FIRST TIME)
+        // 🔹 Save device_name
         if (!empty($input['device_name'])) {
-            $stmt = $pdo->prepare("
+            $name = trim($input['device_name']);
+
+            $stmt = $conn->prepare("
                 UPDATE devices 
                 SET device_name = ? 
                 WHERE id = ?
             ");
-            $stmt->execute([
-                trim($input['device_name']),
-                $device['id']
-            ]);
 
-            $device['device_name'] = trim($input['device_name']);
+            $stmt->bind_param("si", $name, $device['id']);
+            $stmt->execute();
+
+            $device['device_name'] = $name;
         }
 
-        // 🔹 Save device_id (FIRST TIME)
+        // 🔹 Save device_id
         if (!empty($input['device_id'])) {
-            $stmt = $pdo->prepare("
+            $deviceId = $input['device_id'];
+
+            $stmt = $conn->prepare("
                 UPDATE devices 
                 SET device_id = ? 
                 WHERE id = ?
             ");
-            $stmt->execute([
-                $input['device_id'],
-                $device['id']
-            ]);
 
-            $device['device_id'] = $input['device_id'];
+            $stmt->bind_param("si", $deviceId, $device['id']);
+            $stmt->execute();
+
+            $device['device_id'] = $deviceId;
         }
     }
 
     // ===============================
-    // 🔹 STEP 2: HEARTBEAT UPDATE
+    // 🔹 STEP 2: HEARTBEAT
     // ===============================
 
     $updatedDevice = update_device_heartbeat($device, [
@@ -107,6 +120,13 @@ try {
         "app_version" => $input["app_version"] ?? null,
         "device_meta" => $input["device_meta"] ?? null,
     ]);
+
+    if (!$updatedDevice) {
+        api_response([
+            "success" => false,
+            "error" => "Failed to update device"
+        ], 500);
+    }
 
     $deviceName = $updatedDevice["device_name"] ?? "Unnamed Device";
 
@@ -117,7 +137,7 @@ try {
     api_response([
         "success" => true,
         "device" => [
-            "device_id"        => $updatedDevice["device_id"],
+            "device_id"        => $updatedDevice["device_id"] ?? null,
             "device_name"      => $deviceName,
             "status"           => $updatedDevice["status"] ?? "unknown",
             "is_active"        => (bool) ($updatedDevice["is_active"] ?? false),
@@ -130,7 +150,8 @@ try {
         "config" => get_device_runtime_config($updatedDevice),
     ]);
 
-} catch (Exception $e) {
+} catch (Throwable $e) {
+
     api_response([
         "success" => false,
         "error"   => $e->getMessage()
