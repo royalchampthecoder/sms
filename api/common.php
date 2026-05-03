@@ -1,92 +1,148 @@
 <?php
 declare(strict_types=1);
 
-require_once __DIR__ . "/../dashboard/functions.php";
+/**
+ * ===============================
+ * COMMON CORE FILE (MYSQLI VERSION)
+ * ===============================
+ * - Uses config.php ($conn)
+ * - JSON helpers
+ * - Auth helpers
+ * - Shared utilities
+ */
 
-header("Content-Type: application/json");
-header("Access-Control-Allow-Origin: *");
-header("Access-Control-Allow-Methods: GET, POST, OPTIONS");
-header("Access-Control-Allow-Headers: Content-Type, Authorization, X-API-Key");
+require_once __DIR__ . "/config.php";
 
-if ($_SERVER["REQUEST_METHOD"] === "OPTIONS") {
-    http_response_code(204);
-    exit;
+// ===============================
+// 🔹 DATABASE INSTANCE
+// ===============================
+function db(): mysqli {
+    global $conn;
+
+    if (!$conn || $conn->connect_error) {
+        api_response([
+            "success" => false,
+            "error" => "Database connection failed"
+        ], 500);
+    }
+
+    return $conn;
 }
 
-function api_response(array $data, int $status = 200): never
-{
-    http_response_code($status);
-    echo json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-    exit;
-}
-
-function api_input(): array
-{
+// ===============================
+// 🔹 JSON INPUT
+// ===============================
+function api_input(): array {
     $raw = file_get_contents("php://input");
-    $decoded = json_decode($raw ?: "{}", true);
-    if (is_array($decoded) && $decoded !== []) {
-        return $decoded;
-    }
 
-    return $_POST ?: $_GET;
+    if (!$raw) return [];
+
+    $data = json_decode($raw, true);
+
+    return is_array($data) ? $data : [];
 }
 
-function api_key_from_request(array $input = []): string
-{
-    $authHeader = $_SERVER["HTTP_AUTHORIZATION"] ?? "";
-    if (str_starts_with(strtolower($authHeader), "bearer ")) {
-        return trim(substr($authHeader, 7));
-    }
+// ===============================
+// 🔹 JSON RESPONSE
+// ===============================
+function api_response(array $data, int $status = 200): void {
+    http_response_code($status);
+    header("Content-Type: application/json");
 
-    return trim(
-        (string) (
-            $_SERVER["HTTP_X_API_KEY"]
-            ?? $input["api_key"]
-            ?? $_GET["api_key"]
-            ?? ""
-        )
-    );
+    echo json_encode($data, JSON_UNESCAPED_UNICODE);
+    exit;
 }
 
-function require_api_client(array $input = []): array
-{
-    $apiKey = api_key_from_request($input);
-    if ($apiKey === "") {
-        api_response(["success" => false, "error" => "API key is required."], 401);
+// ===============================
+// 🔹 DEVICE AUTH (SAFE)
+// ===============================
+function require_device_auth(array $input): ?array {
+    $conn = db();
+
+    if (empty($input['device_id']) || empty($input['api_key'])) {
+        return null;
     }
 
-    $api = get_api_client_by_key($apiKey);
-    if ($api === null) {
-        api_response(["success" => false, "error" => "Invalid or expired API key."], 401);
-    }
+    $stmt = $conn->prepare("
+        SELECT * FROM devices 
+        WHERE device_id = ? AND api_key = ?
+        LIMIT 1
+    ");
 
-    if (!api_request_allowed((int) $api["id"], (int) $api["rate_limit_per_minute"])) {
-        api_response(["success" => false, "error" => "API rate limit exceeded."], 429);
-    }
+    if (!$stmt) return null;
 
-    db_run("UPDATE apis SET last_used_at = NOW() WHERE id = ?", [$api["id"]]);
-    log_activity("api", "api.request", ["endpoint" => basename($_SERVER["SCRIPT_NAME"] ?? "")], null, (int) $api["id"]);
+    $stmt->bind_param("ss", $input['device_id'], $input['api_key']);
+    $stmt->execute();
 
-    return $api;
+    $result = $stmt->get_result();
+    $device = $result->fetch_assoc();
+
+    return $device ?: null;
 }
 
-function require_device_auth(array $input = []): array
-{
-    $deviceId = trim((string) ($input["device_id"] ?? ""));
-    $apiKey = trim((string) ($input["api_key"] ?? api_key_from_request($input)));
+// ===============================
+// 🔹 UPDATE HEARTBEAT
+// ===============================
+function update_device_heartbeat(array $device, array $data): array {
+    $conn = db();
 
-    if ($deviceId === "" || $apiKey === "") {
-        api_response(["success" => false, "error" => "device_id and api_key are required."], 401);
-    }
+    $stmt = $conn->prepare("
+        UPDATE devices SET
+            last_seen = NOW(),
+            battery = IFNULL(?, battery),
+            network = IFNULL(?, network),
+            app_version = IFNULL(?, app_version),
+            device_meta = IFNULL(?, device_meta)
+        WHERE id = ?
+    ");
 
-    $device = validate_device_credentials($deviceId, $apiKey);
-    if ($device === null) {
-        api_response(["success" => false, "error" => "Invalid device credentials."], 401);
-    }
+    $battery     = $data['battery'];
+    $network     = $data['network'];
+    $appVersion  = $data['app_version'];
+    $deviceMeta  = $data['device_meta'];
+    $id          = $device['id'];
 
-    if (!(bool) $device["is_active"]) {
-        api_response(["success" => false, "error" => "Device is inactive."], 403);
-    }
+    $stmt->bind_param("ssssi", $battery, $network, $appVersion, $deviceMeta, $id);
+    $stmt->execute();
 
-    return $device;
+    // 🔹 Return updated row
+    $stmt = $conn->prepare("SELECT * FROM devices WHERE id = ?");
+    $stmt->bind_param("i", $id);
+    $stmt->execute();
+
+    $result = $stmt->get_result();
+    return $result->fetch_assoc();
+}
+
+// ===============================
+// 🔹 PENDING SMS COUNT
+// ===============================
+function device_pending_count(int $deviceId): int {
+    $conn = db();
+
+    $status = "pending";
+
+    $stmt = $conn->prepare("
+        SELECT COUNT(*) as total
+        FROM sms_queue 
+        WHERE device_id = ? AND status = ?
+    ");
+
+    $stmt->bind_param("is", $deviceId, $status);
+    $stmt->execute();
+
+    $result = $stmt->get_result()->fetch_assoc();
+
+    return (int) ($result['total'] ?? 0);
+}
+
+// ===============================
+// 🔹 DEVICE RUNTIME CONFIG
+// ===============================
+function get_device_runtime_config(array $device): array {
+    return [
+        "poll_interval" => 5,
+        "max_batch"     => 10,
+        "retry_limit"   => 3,
+    ];
 }
